@@ -6,7 +6,21 @@
 
 ## 📄 文档目录
 
+### [v4-flowcharts.md](./v4-flowcharts.md)
+**Uniswap v4 核心流程图**
+
+用 Mermaid 图直观呈现 v4 的执行路径，包括：
+- 整体交互时序图（Flash Accounting unlock ↔ callback ↔ settle）
+- Swap 完整流程（beforeSwap Hook → 跨 Tick 循环 → afterSwap Hook）
+- 添加/移除流动性流程（tick 更新 → 费用快照 → delta 计算）
+- Hook 权限位图（14 个标志位说明）
+- ERC20 / ETH / ERC6909 费用结算流程对比
+- Pool.State 存储结构 ER 图
+
+---
+
 ### [uniswap_v4_core_analysis.md](./uniswap_v4_core_analysis.md)
+
 **Uniswap v4-core 代码深度分析**
 
 对 v4-core 整体代码库的结构性解读，包括：
