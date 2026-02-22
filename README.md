@@ -19,6 +19,20 @@
 
 ---
 
+### [v4-liquidity-management.md](./v4-liquidity-management.md)
+**Uniswap v4 流动性池管理详解**
+
+深入讲解 v4 如何管理流动性池的每个环节，包括：
+- PoolKey 五元组标识与 PoolId 生成
+- Pool.State 完整状态结构（Slot0 打包、ticks、positions、tickBitmap）
+- 添加流动性的分步流程（tick 更新 → 费用快照 → Position 更新 → delta 计算）
+- 移除流动性与 tick 数据清理
+- Swap 时跨 tick 的流动性切换（crossTick / liquidityNet）
+- Position Salt 机制（同 owner 多仓位）
+- 费用结算的 O(1) 差分原理
+
+---
+
 ### [uniswap_v4_core_analysis.md](./uniswap_v4_core_analysis.md)
 
 **Uniswap v4-core 代码深度分析**
