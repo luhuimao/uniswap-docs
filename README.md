@@ -33,6 +33,20 @@
 
 ---
 
+### [v4-swap-mechanism.md](./v4-swap-mechanism.md)
+**Uniswap v4 Swap 原理详解**
+
+深入解析 swap 的完整执行过程，包括：
+- exactInput / exactOutput 双模式参数约定
+- 费率叠加计算（lpFee + protocolFee + 动态覆盖）
+- 跨 Tick 迭代循环的每一步（查找 tick → computeSwapStep → 协议费分配 → 全局费累积 → crossTick）
+- SwapMath.computeSwapStep 精确输入/输出的内部逻辑
+- tick - 1 修正的原因与影响
+- 最终 BalanceDelta 的计算规则
+- 集中流动性 AMM 数学基础（Q64.96 定点数）
+
+---
+
 ### [uniswap_v4_core_analysis.md](./uniswap_v4_core_analysis.md)
 
 **Uniswap v4-core 代码深度分析**
