@@ -103,6 +103,35 @@
 
 ---
 
+### [v4-hooks.md](./v4-hooks.md)
+**Uniswap v4 钩子（Hooks）全面解析**
+
+深入讲解 V4 最核心的可扩展机制，包括：
+- 10 个 Hook 回调函数接口（`IHooks.sol`）完整签名
+- `Hooks.sol` 14 个权限标志位常量与地址编码原理
+- `beforeSwap` / `afterSwap` 内部调度逻辑与 `BeforeSwapDelta` 机制
+- 动态费用系统（`LPFeeLibrary`：`DYNAMIC_FEE_FLAG` / `OVERRIDE_FEE_FLAG`）
+- 实战代码示例：动态费用钩子、自定义 AMM 曲线、`afterSwap` 费用收取、最小化基础合约
+- CREATE2 地址挖矿原理与工具（HookMiner / V4 Hook Address Miner）
+- 安全风险分析（DoS 攻击、流动性锁定）
+
+---
+
+### [sqrt-price-math.md](./sqrt-price-math.md)
+**SqrtPriceMath：`getAmount1Delta` 深度解析**
+
+从数学原理到 Solidity 实现完整拆解 token1 数量计算，包括：
+- 集中流动性核心公式 $\Delta y = L \cdot (\sqrt{P_B} - \sqrt{P_A})$ 的推导
+- Q64.96 定点数格式与整数化变换
+- `absDiff` 无分支汇编绝对值原理
+- `FullMath.mulDiv` 512 位中间结果防溢出机制
+- `roundUp` 向上/向下取整的使用场景
+- 有符号 `int128 liquidity` 版本的符号规则（添加 vs 移除流动性）
+- 与 `getAmount0Delta`（倒数关系）的对比
+- ETH/USDC 完整数值计算示例
+
+---
+
 ## 🗂️ 数据来源
 
 分析基于 Uniswap v4-core 官方源码：
