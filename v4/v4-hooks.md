@@ -293,302 +293,114 @@ constructor(IPoolManager _manager) {
 
 ## 钩子在底层是如何工作的
 
-### `beforeSwap` 的内部调度逻辑
+### 钩子的核心逻辑
 
-`Hooks.sol` 中 `beforeSwap` 的实现展示了调度的完整流程：
+要理解钩子的内部工作原理，必需检查其功能结构。在 Uniswap V4 中，为每个钩子函数定义了特定的输入和输出数据格式。本节探讨这些函数的结构，详细说明钩子从 Uniswap V4 合约接收的数据以及它们可以对这些数据执行的操作。
 
-```solidity
-function beforeSwap(
-    IHooks self,
-    PoolKey memory key,
-    SwapParams memory params,
-    bytes calldata hookData
-) internal returns (int256 amountToSwap, BeforeSwapDelta hookReturn, uint24 lpFeeOverride) {
-    amountToSwap = params.amountSpecified;
+让我们以 `beforeSwap` / `afterSwap` 为例。
 
-    // 自调用保护：钩子本身触发的交换不再触发钩子
-    if (msg.sender == address(self)) return (amountToSwap, BeforeSwapDeltaLibrary.ZERO_DELTA, lpFeeOverride);
+**`beforeSwap` 函数**在 `PoolManager` 执行交换逻辑之前被触发。它从 `PoolManager` 接收五个关键参数：
 
-    if (self.hasPermission(BEFORE_SWAP_FLAG)) {
-        bytes memory result = callHook(self, abi.encodeCall(IHooks.beforeSwap, (msg.sender, key, params, hookData)));
+| 参数 | 描述 |
+|---|---|
+| `sender` | 发起交换的地址（通常是 Router） |
+| `key` | 池的标识符（包含配置信息） |
+| `params` | 交换参数（金额、方向、滑点限制等） |
+| `hookData` | 传递给钩子的自定义数据 |
 
-        // 返回值长度必须为 96 字节（bytes4 + BeforeSwapDelta + uint24）
-        if (result.length != 96) InvalidHookResponse.selector.revertWith();
+这意味着每次发生交换时，钩子可以访问以下关键数据：
 
-        // 动态费用池可通过 OVERRIDE_FEE_FLAG 覆写本次交换的费用
-        if (key.fee.isDynamicFee()) lpFeeOverride = result.parseFee();
+- 谁发起了交换
+- 希望交换多少
+- 交易买入/卖出的是什么代币
+- 用户设置的滑点限制
 
-        // 若钩子声明会返回 delta，则解析并调整 amountToSwap
-        if (self.hasPermission(BEFORE_SWAP_RETURNS_DELTA_FLAG)) {
-            hookReturn = BeforeSwapDelta.wrap(result.parseReturnDelta());
-            int128 hookDeltaSpecified = hookReturn.getSpecifiedDelta();
-            if (hookDeltaSpecified != 0) {
-                bool exactInput = amountToSwap < 0;
-                amountToSwap += hookDeltaSpecified;
-                // 确保交换方向不因 delta 调整而改变（exactIn ↔ exactOut）
-                if (exactInput ? amountToSwap > 0 : amountToSwap < 0) {
-                    HookDeltaExceedsSwapAmount.selector.revertWith();
-                }
-            }
-        }
-    }
-}
-```
+在执行其逻辑后，`beforeSwap` 将以下值返回给 `PoolManager`：
 
-### `afterSwap` 的内部调度逻辑
+| 返回值 | 描述 |
+|---|---|
+| `bytes4` | 函数选择器，用于验证钩子调用合法性 |
+| `BeforeSwapDelta` | 钩子对交换金额的主动修改 |
+| `uint24 lpFeeOverride` | 动态覆写的 LP 费用（可选） |
 
-```solidity
-function afterSwap(
-    IHooks self,
-    PoolKey memory key,
-    SwapParams memory params,
-    BalanceDelta swapDelta,
-    bytes calldata hookData,
-    BeforeSwapDelta beforeSwapHookReturn
-) internal returns (BalanceDelta, BalanceDelta) {
-    if (msg.sender == address(self)) return (swapDelta, BalanceDeltaLibrary.ZERO_DELTA);
+此时，我们可以看到钩子不仅仅是被动扩展，而是与池的操作进行积极交互的强大机制。
 
-    // 将 beforeSwap 中未处理的 unspecified delta 传递给 afterSwap 继续处理
-    int128 hookDeltaSpecified   = beforeSwapHookReturn.getSpecifiedDelta();
-    int128 hookDeltaUnspecified = beforeSwapHookReturn.getUnspecifiedDelta();
-
-    if (self.hasPermission(AFTER_SWAP_FLAG)) {
-        hookDeltaUnspecified += self.callHookWithReturnDelta(
-            abi.encodeCall(IHooks.afterSwap, (msg.sender, key, params, swapDelta, hookData)),
-            self.hasPermission(AFTER_SWAP_RETURNS_DELTA_FLAG)
-        ).toInt128();
-    }
-
-    // 合并 hookDelta 并从 swapDelta 中扣除（由调用方承担钩子的 delta）
-    BalanceDelta hookDelta;
-    if (hookDeltaUnspecified != 0 || hookDeltaSpecified != 0) {
-        hookDelta = (params.amountSpecified < 0 == params.zeroForOne)
-            ? toBalanceDelta(hookDeltaSpecified, hookDeltaUnspecified)
-            : toBalanceDelta(hookDeltaUnspecified, hookDeltaSpecified);
-        swapDelta = swapDelta - hookDelta;
-    }
-    return (swapDelta, hookDelta);
-}
-```
-
-### 调用工具函数
-
-`Hooks.sol` 提供了两个底层调用辅助函数：
-
-```solidity
-// 用于不返回 delta 的钩子调用（beforeInitialize、beforeDonate 等）
-function callHook(IHooks self, bytes memory data) internal returns (bytes memory result) {
-    bool success;
-    assembly ("memory-safe") {
-        success := call(gas(), self, 0, add(data, 0x20), mload(data), 0, 0)
-    }
-    // 失败时携带原始 revert 信息抛出 HookCallFailed
-    if (!success) CustomRevert.bubbleUpAndRevertWith(address(self), bytes4(data), HookCallFailed.selector);
-    // ... 拷贝 returndata ...
-    // 验证返回的函数选择器
-    if (result.length < 32 || result.parseSelector() != data.parseSelector()) {
-        InvalidHookResponse.selector.revertWith();
-    }
-}
-
-// 用于返回 delta 的钩子调用（afterSwap、afterAddLiquidity 等）
-function callHookWithReturnDelta(IHooks self, bytes memory data, bool parseReturn) internal returns (int256) {
-    bytes memory result = callHook(self, data);
-    if (!parseReturn) return 0;                         // 未声明 RETURNS_DELTA_FLAG，默认 0
-    if (result.length != 64) InvalidHookResponse.selector.revertWith(); // bytes4 + int256
-    return result.parseReturnDelta();
-}
-```
-
-### 防止自调用的 `noSelfCall` 修饰符
-
-```solidity
-// 防止钩子合约自身触发的操作再次递归调用钩子
-modifier noSelfCall(IHooks self) {
-    if (msg.sender != address(self)) {
-        _;
-    }
-}
-```
-
-这个修饰符用于不需要 delta 返回值的钩子（`beforeInitialize`、`afterInitialize`、`beforeDonate`、`afterDonate`），避免递归调用导致的无限循环。
+两个关键返回值——`beforeSwapDelta` 和 `lpFeeOverride`——允许钩子动态调整交换流程和费用结构。
 
 ---
 
-## 动态费用机制：`LPFeeLibrary.sol`
+### `beforeSwapDelta`：对交换的主动影响
 
-> 源文件：[`src/libraries/LPFeeLibrary.sol`](../../v4-core/src/libraries/LPFeeLibrary.sol)
+`beforeSwapDelta` 值与 Uniswap V4 的**债务结算模型**直接相关。在 V4 中，交换在 Router 和池之间造成临时的债务，这些债务随后将被清偿。类似地，钩子可以与池建立债务关系，从而主动干预交换过程。
 
-动态费用通过几个关键常量和函数实现：
+例如，钩子可以：
 
-```solidity
-library LPFeeLibrary {
+- 获取用户交换的一部分作为费用或返还
+- 根据自定义条件修改交易执行路径
+- 根据市场状况提供动态的滑点调整
 
-    /// @notice 费用 = 0x800000 时标识该池为动态费用池
-    /// 注意：0x800000 > MAX_LP_FEE，因此它不是一个合法的静态费用值
-    uint24 public constant DYNAMIC_FEE_FLAG  = 0x800000;
-
-    /// @notice beforeSwap 返回的费用若要覆写当前费用，需设置此标志位（第23位）
-    uint24 public constant OVERRIDE_FEE_FLAG = 0x400000;
-
-    /// @notice 移除覆写标志时使用的掩码
-    uint24 public constant REMOVE_OVERRIDE_MASK = 0xBFFFFF;
-
-    /// @notice 最大 LP 费用：100%（以万分之一为单位，1_000_000 = 100%）
-    uint24 public constant MAX_LP_FEE = 1_000_000;
-
-    function isDynamicFee(uint24 self) internal pure returns (bool) {
-        return self == DYNAMIC_FEE_FLAG;
-    }
-
-    function isOverride(uint24 self) internal pure returns (bool) {
-        return self & OVERRIDE_FEE_FLAG != 0;
-    }
-
-    function removeOverrideFlagAndValidate(uint24 self) internal pure returns (uint24 fee) {
-        fee = self & REMOVE_OVERRIDE_MASK; // 移除覆写标志
-        if (fee > MAX_LP_FEE) revert LPFeeTooLarge(fee);
-    }
-}
-```
-
-**动态费用的两种使用方式**：
-
-1. **永久性更新**：调用 `IPoolManager.updateDynamicLPFee(key, newFee)`，永久修改池的 LP 费用。
-2. **单次覆写**：在 `beforeSwap` 返回携带 `OVERRIDE_FEE_FLAG` 的费用值（如 `0x400000 | newFee`），仅对本次交换生效。
+> **注意**：钩子并不要求返回 `beforeSwapDelta` 值。有些钩子可能完全不影响交换机制，而是执行独立、不干扰的操作。
 
 ---
 
-## 实战代码示例
+### `lpFeeOverride`：动态费用调整
 
-### 示例一：动态费用钩子
+`lpFeeOverride` 与 Uniswap V4 的**动态费用系统**相关。在 Uniswap V4 中，根据市场条件，费用可以动态变化，但只能通过钩子实现。
 
-> 源文件：[`src/test/DynamicFeesTestHook.sol`](../../v4-core/src/test/DynamicFeesTestHook.sol)
+动态费用实现的两种方法是：
 
-```solidity
-contract DynamicFeesTestHook is BaseTestHooks {
-    uint24 internal fee;
-    IPoolManager manager;
+#### 1. 永久性费用更新
 
-    /// @notice 池初始化后立即设置初始动态费用
-    function afterInitialize(address, PoolKey calldata key, uint160, int24)
-        external override returns (bytes4)
-    {
-        manager.updateDynamicLPFee(key, fee); // 永久性更新池费用
-        return IHooks.afterInitialize.selector;
-    }
+钩子可以调用 `updateDynamicLPFee` 函数，永久性调整池的费用，以响应高波动性或低流动性等事件。这允许池：
 
-    /// @notice 每次 swap 前更新费用（实现基于预言机/波动率的动态调整）
-    function beforeSwap(address, PoolKey calldata key, SwapParams calldata, bytes calldata)
-        external override returns (bytes4, BeforeSwapDelta, uint24)
-    {
-        manager.updateDynamicLPFee(key, fee); // 永久性更新
-        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-        // 若要仅对本次 swap 生效，可返回：
-        // return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
-    }
-}
-```
+- 在市场动荡期间提高费用（以补偿 LP 的更高风险）
+- 在交易量较低时降低费用，以鼓励更多交换
 
-### 示例二：自定义曲线钩子（替换集中流动性 AMM）
+#### 2. 临时费用调整
 
-> 源文件：[`src/test/CustomCurveHook.sol`](../../v4-core/src/test/CustomCurveHook.sol)
+通过修改 `lpFeeOverride`，钩子可以仅针对特定用户或交易应用自定义费用，而不是改变池的默认费用。例如：
 
-该示例演示如何通过 `beforeSwapDelta` 完全接管交换逻辑，实现自定义 AMM 曲线（此处为 1:1 线性曲线）。
+- 为 NFT 持有者提供折扣费用
+- 对套利者收取更高费用
+- 为特定交易行为提供定制激励措施
 
-```solidity
-contract CustomCurveHook is BaseTestHooks {
-    IPoolManager immutable manager;
+这种灵活性使得 Uniswap V4 能够在**交易级别**实现定制的费用政策，而传统的 AMM 无法做到这一点。
 
-    function beforeSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        bytes calldata
-    ) external override onlyPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
-        (Currency inputCurrency, Currency outputCurrency, uint256 amount) =
-            _getInputOutputAndAmount(key, params);
+---
 
-        // 自定义曲线：1:1 线性兑换
-        // 1. 从池中取出用户输入的代币
-        manager.take(inputCurrency, address(this), amount);
-        // 2. 向池中存入等量的输出代币
-        outputCurrency.settle(manager, address(this), amount, false);
+### `beforeSwap` 支持的三个关键操作
 
-        // 3. 通过返回负的 amountSpecified，让 PoolManager "no-op" 原有集中流动性逻辑
-        BeforeSwapDelta hookDelta = toBeforeSwapDelta(
-            int128(-params.amountSpecified),  // specified delta：抵消原始金额
-            int128(params.amountSpecified)    // unspecified delta：提供输出金额
-        );
-        return (IHooks.beforeSwap.selector, hookDelta, 0);
-    }
-}
-```
+总之，`beforeSwap` 允许钩子执行三个关键操作：
 
-> **核心原理**：通过将 `specified delta` 设置为 `-amountSpecified`，钩子将整个交换金额"吸收"，使 `PoolManager` 中的集中流动性路径成为 no-op，交换完全由钩子的自定义逻辑处理。
+#### 1. 访问控制
 
-### 示例三：afterSwap 交易费用收取钩子
+Uniswap V4 钩子可以通过在 `beforeSwap` 函数中验证发送地址，使开发者能够实施访问控制机制。这意味着钩子可以强制执行允许执行交换的用户自定义条件。例如，池可以被设计成只有持有特定 NFT 的用户才能在其中进行交易。
 
-> 源文件：[`src/test/FeeTakingHook.sol`](../../v4-core/src/test/FeeTakingHook.sol)
+然而，有一点需要注意的是，用户在执行交换时并不直接与 `PoolManager` 交互。相反，他们通常通过 Router 合约进行交互，然后 Router 再与 `PoolManager` 交互。因此，在 `beforeSwap` 中，钩子看到的发送者地址通常是 Router 地址，而不是实际用户地址。
 
-```solidity
-contract FeeTakingHook is BaseTestHooks {
-    uint128 public constant SWAP_FEE_BIPS = 123;  // 1.23%
-    uint128 public constant TOTAL_BIPS    = 10000;
+因此，**访问控制逻辑通常是在 Router 级别实现的**，而不是钩子内部。钩子决定哪个 Router 应执行交换，而 Router 负责用户身份验证和权限实施。
 
-    function afterSwap(
-        address,
-        PoolKey calldata key,
-        SwapParams calldata params,
-        BalanceDelta delta,
-        bytes calldata
-    ) external override onlyPoolManager returns (bytes4, int128) {
-        // 在 unspecified 代币（输出代币）上按比例计算并收取手续费
-        bool specifiedTokenIs0 = (params.amountSpecified < 0 == params.zeroForOne);
-        (Currency feeCurrency, int128 swapAmount) = specifiedTokenIs0
-            ? (key.currency1, delta.amount1())
-            : (key.currency0, delta.amount0());
+#### 2. 干预交换逻辑
 
-        if (swapAmount < 0) swapAmount = -swapAmount;
-        uint256 feeAmount = uint128(swapAmount) * SWAP_FEE_BIPS / TOTAL_BIPS;
+Uniswap V4 钩子可以直接在交换执行逻辑中干预。因为钩子从 `PoolManager` 获取所有相关交易细节，所以它们可以动态调整交易执行参数并修改结果。
 
-        // 从 PoolManager 中取走手续费，发送到本合约（钩子金库）
-        manager.take(feeCurrency, address(this), feeAmount);
+这一能力促成了各种用例，例如：
 
-        // 返回正数 delta：通知 PoolManager 钩子从用户输出中"取走"了 feeAmount
-        return (IHooks.afterSwap.selector, feeAmount.toInt128());
-    }
-}
-```
+- 实施为特定需求量身定制的交换逻辑
+- 针对不同类型的池调整执行机制
+- 针对不同市场状况优化交换策略
 
-### 示例四：BaseTestHooks — 最小化基础合约
+默认情况下，Uniswap V4 使用集中流动性，将价格范围划分为多个涨落区间，每个涨落区间遵循 `x * y = k` CPMM 算法。然而，钩子可以覆盖这一行为，并应用替代的交换逻辑。
 
-> 源文件：[`src/test/BaseTestHooks.sol`](../../v4-core/src/test/BaseTestHooks.sol)
+例如，钩子可以针对稳定币对实现与 Curve 类似的 **StableSwap 算法**，降低滑点，提高资本效率，尤其是对于大规模交易。
 
-在实际开发中，无需实现所有 10 个钩子函数。推荐继承 `BaseTestHooks`，只覆盖（`override`）你需要的函数：
+#### 3. 动态费用调整
 
-```solidity
-contract BaseTestHooks is IHooks {
-    error HookNotImplemented();
+最后，钩子能够动态调整 LP 费用，为流动性提供者（LP）提供更大的灵活性和潜在收益。
 
-    // 所有未覆写的函数默认 revert HookNotImplemented()
-    function beforeSwap(
-        address, PoolKey calldata, SwapParams calldata, bytes calldata
-    ) external virtual returns (bytes4, BeforeSwapDelta, uint24) {
-        revert HookNotImplemented();
-    }
+最常见的动态费用模型之一是**基于波动率的费用调整**。在高度波动的情况下，LP 面临非永久性损失（IL）和与再平衡损失（LVR），可能导致经济损失。为补偿这一风险，池可以在高波动时期实施更高的费用，以提升整体 LP 收入并吸引更深的流动性。
 
-    function afterSwap(
-        address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata
-    ) external virtual returns (bytes4, int128) {
-        revert HookNotImplemented();
-    }
-
-    // ... 其他函数同理 ...
-}
-```
-
-这样，`PoolManager` 只会调用在地址中标记为已实现的函数（通过权限位判断），未标记的函数不会被调用，因此 `HookNotImplemented` 永远不会触发。
+> **重要**：钩子无法修改所有池的费用。只有明确启用动态费用的池能被钩子调整费用。这意味着，在固定费用池中交易的用户无需担心不可预测的费用变化。
 
 ---
 
@@ -610,13 +422,42 @@ Uniswap V4 不允许钩子随意附加到任何池。当 `PoolManager` 部署一
 
 这一二进制表示的每一位（`0` 或 `1`）对应一个特定的钩子函数。如果某一位为 `1`，表示钩子实现了该函数；如果为 `0`，则表示该函数未实现。
 
-在示例 `00C0`（`0000 0000 1100 0000`）中，仅有第 7 位（`beforeSwap`）和第 6 位（`afterSwap`）被设置为 `1`，表示该钩子仅实现这两个函数。
+下表概述了每一位的含义：
+
+| 位（从高到低） | 对应函数 |
+|---|---|
+| 15 | `beforeInitialize` |
+| 14 | `afterInitialize` |
+| 13 | `beforeAddLiquidity` |
+| 12 | `afterAddLiquidity` |
+| 11 | `beforeRemoveLiquidity` |
+| 10 | `afterRemoveLiquidity` |
+| 9 | `beforeSwap` |
+| 8 | `afterSwap` |
+| 7 | `beforeDonate` |
+| 6 | `afterDonate` |
+| 5 | `noOp`（noOp flag for beforeSwap） |
+| 4 | `accessLock` |
+| 3 | `beforeSwapReturnDelta` |
+| 2 | `afterSwapReturnDelta` |
+| 1 | `afterAddLiquidityReturnDelta` |
+| 0 | `afterRemoveLiquidityReturnDelta` |
+
+在示例 `00C0`（`0000 0000 1100 0000`）中，仅有第 7 位（`beforeSwap`）和第 8 位（`afterRemoveLiquidity`）被设置为 `1`，表示该钩子仅实现这两个函数。
 
 ### 为什么将函数编码到地址中？
 
 将钩子函数编码到合约地址本身的原因是**降低 Gas 成本**。
 
+如果 Uniswap 不使用这种方法，`PoolManager` 就无法知道钩子实现了哪些函数。它将不得不尝试调用每一个可能的函数，以确定哪些函数存在。这将导致不必要的函数调用并浪费 Gas。
+
+例如，假设一个钩子仅实现 `beforeSwap`。如果 `PoolManager` 事先不知道这一点，它将试图调用其他函数，比如 `afterSwap`、`beforeAddLiquidity` 等，造成不必要的交易和更高的 Gas 费用。
+
 通过将函数实现直接编码到合约地址中，`PoolManager` 能够很快知道该执行哪些函数。这使得无效的函数调用可以完全跳过，从而降低了 Gas 消耗。
+
+此外，表格中的最后四位（标记为**返回 delta**）指示钩子是否修改了交换或流动性事件的结果。例如，如果一个钩子修改了交换执行逻辑，它应返回一个 `beforeSwapDelta` 值。这一修改的存在通过地址的最后四位表示，从而确保 `PoolManager` 事先知道是否需要对这些变化采取相应的调整。这种设计防止了无用的计算，进一步优化了 Gas 效率。
+
+---
 
 ### 使用 CREATE2 进行地址挖矿
 
@@ -639,13 +480,17 @@ address = keccak256(0xff + sender + salt + keccak256(init_code))
 
 ### 简化工具
 
-Uniswap 提供了以下工具来简化地址挖矿流程：
+虽然 `CREATE2` 使开发者能够生成正确的钩子地址，但手动搜索正确的 `salt` 可能非常繁琐。此外，测试钩子也变得不便利，因为开发者在每次部署修改过的合约时都必须重复寻找一个新的有效地址。
+
+为简化这一过程，Uniswap 提供了以下工具：
 
 - **[HookMiner](https://github.com/Uniswap/v4-template)**：自动化地址挖矿过程，使开发者能够高效地找到其钩子的有效地址进行测试。
 - **[V4 Hook Address Miner](https://uniswaphooks.com/)**（基于 Web 的 UI 工具）：允许开发者：
   - 选择他们希望在钩子中实现的功能
   - 自动生成一个有效地址所需的 `salt`
   - 部署他们的钩子合约，而无需手动挖找有效地址
+
+通过利用这些工具，开发者能够无缝部署格式正确的钩子，从而使 Uniswap V4 钩子生态系统更加开放和便捷。
 
 ---
 
